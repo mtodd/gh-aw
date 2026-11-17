@@ -727,13 +727,17 @@
     let view = null;
     const vis = i => !view || view.set.has(i);
     const firstVis = () => slides.findIndex((s, i) => vis(i));
-    const lastVis = () => { for (let i = slides.length - 1; i >= 0; i--) if (vis(i)) return i; return -1; };
+    const lastVis = () => {
+      for (let i = slides.length - 1; i >= 0; i--) if (vis(i)) return i;
+      return -1;
+    };
     const hashFor = n => `#${slides[n].id}${view ? "&" + view.key : ""}`;
 
     // ---------- navigation ----------
     let cur = -1,
       redT = null,
-      bgN = null; // slide whose THEME the background shows while a staged light/dark swap is pending
+      bgN = null, // slide whose THEME the background shows while a staged light/dark swap is pending
+      raf = null;
     // entering a "red" slide forward: the current slide first fades to red, then the red slide enters under the wash
     function go(n) {
       n = Math.max(0, Math.min(slides.length - 1, n));
@@ -755,6 +759,7 @@
         wash.classList.remove("on");
         redT = setTimeout(() => {
           bgN = n;
+          requestFrame();
           document.body.classList.toggle("light", !!THEME[slides[n].group].light);
           redT = setTimeout(() => {
             redT = null;
@@ -802,6 +807,7 @@
       void el.offsetWidth; // restart CSS animations on re-entry
       el.classList.add("active");
       cur = n;
+      requestFrame();
       slides[n].enter?.(dir);
       chrome(n);
     }
@@ -1172,7 +1178,13 @@
     const fz = h(
       "dialog",
       { class: "fz", "aria-label": "Search slides" },
-      h("div", { class: "fz-box" }, h("div", { class: "fz-bar" }, fzIn, h("button", { class: "fz-x", type: "button", "aria-label": "Close search (Esc)", "aria-keyshortcuts": "Escape", title: "Close search (Esc)", onclick: () => fz.close() }, "Esc")), fzSt, fzList)
+      h(
+        "div",
+        { class: "fz-box" },
+        h("div", { class: "fz-bar" }, fzIn, h("button", { class: "fz-x", type: "button", "aria-label": "Close search (Esc)", "aria-keyshortcuts": "Escape", title: "Close search (Esc)", onclick: () => fz.close() }, "Esc")),
+        fzSt,
+        fzList
+      )
     );
     document.body.append(fz);
     const fzPaint = () => {
@@ -1281,7 +1293,12 @@
       "div",
       { class: "smp-d", role: "group", "aria-label": "Design a view" },
       smpCount,
-      dbtn("Select all", "A", "A", () => smpPick(slides.map((s, i) => i), true)),
+      dbtn("Select all", "A", "A", () =>
+        smpPick(
+          slides.map((s, i) => i),
+          true
+        )
+      ),
       dbtn("Clear", "C", "C", () => smpPick([...smpSel], false)),
       smpTitle,
       smpLink,
@@ -1546,12 +1563,47 @@
       gAng = THEME[slides[0].group].ang;
     const blobs = [0, 1, 2, 3].map(i => ({ a: Math.random() * 6.28, b: Math.random() * 6.28, s: 0.00007 + i * 0.00003 }));
     const rmq = matchMedia("(prefers-reduced-motion: reduce)");
-    let REDUCED = rmq.matches;
+    let REDUCED = rmq.matches,
+      dirty = true;
+    // the id check keeps a cancelled or superseded callback from starting a second loop
+    function requestFrame() {
+      if (raf !== null || document.hidden) return;
+      const id = requestAnimationFrame(t => raf === id && frame(t));
+      raf = id;
+    }
+    function repaint() {
+      dirty = true;
+      requestFrame();
+    }
     rmq.addEventListener?.("change", e => {
       REDUCED = e.matches;
+      repaint();
     });
+    addEventListener("resize", repaint);
+    const watchRatio = () =>
+      matchMedia(`(resolution: ${devicePixelRatio}dppx)`).addEventListener?.(
+        "change",
+        () => {
+          watchRatio();
+          repaint();
+        },
+        { once: true }
+      );
+    watchRatio();
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) return repaint();
+      if (raf !== null) cancelAnimationFrame(raf);
+      raf = null;
+    });
+    addEventListener("pageshow", e => e.persisted && repaint());
+    for (const c of [canvas, gridc]) c.addEventListener("contextrestored", repaint);
+    // snap once under 0.001 remains (invisible in any channel), so a finished transition stops repainting
+    const ease = (v, to, rate) => (Math.abs(to - v) < 1e-3 ? to : v + (to - v) * rate);
+    const same = (a, b) => a.every((v, i) => v === b[i]);
 
     function frame(t) {
+      raf = null;
+      if (document.hidden) return;
       const dpr = Math.min(devicePixelRatio || 1, 2);
       const cw = innerWidth,
         ch = innerHeight;
@@ -1560,71 +1612,80 @@
       if (canvas.width !== bw || canvas.height !== bh) {
         canvas.width = bw;
         canvas.height = bh;
+        dirty = true;
       }
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
       const cs = slides[bgN ?? cur] || slides[0],
         th = THEME[cs.group],
         target = th.pal.map(hex),
-        bgt = bgOf(th);
+        bgt = bgOf(th),
+        gTarget = th.ang;
+      const settled = gAng === gTarget && same(bgv, bgt) && colors.every((c, i) => same(c, target[i]));
       // light <-> dark swaps the base quickly so text never sits on the wrong background for long
-      bgv = REDUCED ? bgt : bgv.map((v, i) => v + (bgt[i] - v) * (i < 3 && Math.abs(bgt[0] - bgv[0]) > 90 ? 0.07 : 0.04));
-      colors = REDUCED ? target : colors.map((c, i) => c.map((v, k) => v + (target[i][k] - v) * 0.03));
+      bgv = REDUCED ? bgt : bgv.map((v, i) => ease(v, bgt[i], i < 3 && Math.abs(bgt[0] - bgv[0]) > 90 ? 0.07 : 0.04));
+      colors = REDUCED ? target : colors.map((c, i) => c.map((v, k) => ease(v, target[i][k], 0.03)));
+      // glows below 1 truncate to black, which "lighter" leaves unchanged
+      const drift = !REDUCED && colors.some(c => c.some(v => v >= 1));
 
-      ctx.globalCompositeOperation = "source-over";
-      ctx.fillStyle = `rgb(${bgv[0] | 0},${bgv[1] | 0},${bgv[2] | 0})`;
-      ctx.fillRect(0, 0, cw, ch);
-      ctx.globalCompositeOperation = "lighter";
-      const R = Math.max(cw, ch) * 0.55,
-        bt = REDUCED ? 0 : t;
-      blobs.forEach((b, i) => {
-        const x = cw * (0.5 + 0.3 * Math.sin(bt * b.s * 3 + b.a));
-        const y = ch * (0.5 + 0.26 * Math.cos(bt * b.s * 2.5 + b.b));
-        const [r, g, bl] = colors[i];
-        const grd = ctx.createRadialGradient(x, y, 0, x, y, R);
-        grd.addColorStop(0, `rgba(${r | 0},${g | 0},${bl | 0},0.1)`);
-        grd.addColorStop(1, "rgba(0,0,0,0)");
-        ctx.fillStyle = grd;
+      if (dirty || drift || !settled) {
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.globalCompositeOperation = "source-over";
+        ctx.fillStyle = `rgb(${bgv[0] | 0},${bgv[1] | 0},${bgv[2] | 0})`;
         ctx.fillRect(0, 0, cw, ch);
-      });
+        ctx.globalCompositeOperation = "lighter";
+        const R = Math.max(cw, ch) * 0.55,
+          bt = REDUCED ? 0 : t;
+        blobs.forEach((b, i) => {
+          const x = cw * (0.5 + 0.3 * Math.sin(bt * b.s * 3 + b.a));
+          const y = ch * (0.5 + 0.26 * Math.cos(bt * b.s * 2.5 + b.b));
+          const [r, g, bl] = colors[i];
+          const grd = ctx.createRadialGradient(x, y, 0, x, y, R);
+          grd.addColorStop(0, `rgba(${r | 0},${g | 0},${bl | 0},0.1)`);
+          grd.addColorStop(1, "rgba(0,0,0,0)");
+          ctx.fillStyle = grd;
+          ctx.fillRect(0, 0, cw, ch);
+        });
+      }
 
       // Blueprint grid: `cell` px minor lines, a major line every 5, anchored centre-top, turned (around the screen centre) to the band's `ang`.
-      if (gridc.width !== bw || gridc.height !== bh) {
-        gridc.width = bw;
-        gridc.height = bh;
+      if (dirty || !settled) {
+        if (gridc.width !== bw || gridc.height !== bh) {
+          gridc.width = bw;
+          gridc.height = bh;
+        }
+        const g = gridc.getContext("2d");
+        g.setTransform(dpr, 0, 0, dpr, 0, 0);
+        g.clearRect(0, 0, cw, ch);
+        gAng = REDUCED ? gTarget : gAng + (gTarget - gAng) * 0.035;
+        if (Math.abs(gTarget - gAng) < 1e-4) gAng = gTarget;
+        const k = Math.min(cw / W, ch / H),
+          minor = bgv[8] * k,
+          D = Math.hypot(cw, ch) / 2 + minor;
+        g.translate(cw / 2, ch / 2);
+        g.rotate(gAng);
+        const gc = `${bgv[3] | 0},${bgv[4] | 0},${bgv[5] | 0}`,
+          lmin = `rgba(${gc},${bgv[6]})`,
+          lmaj = `rgba(${gc},${bgv[7]})`;
+        const line = i => (((i % 5) + 5) % 5 ? lmin : lmaj);
+        const snap = gAng ? v => v : v => Math.round(v);
+        for (let i = -Math.ceil(D / minor); i * minor <= D; i++) {
+          g.fillStyle = line(i);
+          g.fillRect(snap(i * minor), -D, 1, 2 * D);
+        }
+        const oy = -ch / 2; // horizontal lines stay anchored to the top edge, as before
+        for (let j = Math.floor((-D - oy) / minor); j * minor + oy <= D; j++) {
+          g.fillStyle = line(j);
+          g.fillRect(-D, snap(j * minor + oy), 2 * D, 1);
+        }
       }
-      const g = gridc.getContext("2d");
-      g.setTransform(dpr, 0, 0, dpr, 0, 0);
-      g.clearRect(0, 0, cw, ch);
-      const gTarget = th.ang;
-      gAng = REDUCED ? gTarget : gAng + (gTarget - gAng) * 0.035;
-      if (Math.abs(gTarget - gAng) < 1e-4) gAng = gTarget;
-      const k = Math.min(cw / W, ch / H),
-        minor = bgv[8] * k,
-        D = Math.hypot(cw, ch) / 2 + minor;
-      g.translate(cw / 2, ch / 2);
-      g.rotate(gAng);
-      const gc = `${bgv[3] | 0},${bgv[4] | 0},${bgv[5] | 0}`,
-        lmin = `rgba(${gc},${bgv[6]})`,
-        lmaj = `rgba(${gc},${bgv[7]})`;
-      const line = i => (((i % 5) + 5) % 5 ? lmin : lmaj);
-      const snap = gAng ? v => v : v => Math.round(v);
-      for (let i = -Math.ceil(D / minor); i * minor <= D; i++) {
-        g.fillStyle = line(i);
-        g.fillRect(snap(i * minor), -D, 1, 2 * D);
-      }
-      const oy = -ch / 2; // horizontal lines stay anchored to the top edge, as before
-      for (let j = Math.floor((-D - oy) / minor); j * minor + oy <= D; j++) {
-        g.fillStyle = line(j);
-        g.fillRect(-D, snap(j * minor + oy), 2 * D, 1);
-      }
+      dirty = false;
 
       slides[cur]?.tick?.(t);
-      requestAnimationFrame(frame);
+      if (drift || !settled || slides[cur]?.tick) requestFrame();
     }
 
     followHash();
-    requestAnimationFrame(frame);
+    requestFrame();
     // tour(name) starts a config.tours entry at its first slide; tour(null) shows every slide again
     const tour = name => {
       const v = name == null ? null : viewFrom({ tour: name });

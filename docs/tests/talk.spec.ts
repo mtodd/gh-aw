@@ -954,13 +954,15 @@ test("keeps an example in a view only together with its pattern slide", async ({
   await expect(example).not.toHaveAttribute("aria-disabled");
 });
 
-// A tiny second deck on runtime.js alone: no talk content, themes, solo labels or sound service.
+// A tiny second deck on runtime.js alone: no talk content, themes (unless ?themes), solo labels or sound service.
 const TINY_DECK = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Tiny deck</title></head><body>
 <script src="./runtime.js"></script>
 <script>
   window.hooks = [];
+  window.ticks = [];
   let steps = 0;
-  const last = new URLSearchParams(location.search).get("last");
+  const query = new URLSearchParams(location.search),
+    last = query.get("last");
   window.CracktroDeck.create({
     slides: ({ h, letters, current }) => {
       const slide = (group, title, extra = {}) => ({ group, notes: title + " notes", el: h("section", { class: "slide" }, h("h2", {}, letters(title))), ...extra });
@@ -971,12 +973,14 @@ const TINY_DECK = `<!doctype html><html lang="en"><head><meta charset="utf-8"><t
           onKey: e => e.key === "x" && hooks.push("key:" + current().notes) > 0,
         }),
         slide("outro", "Goodbye"),
-        slide("part", "Alpha"),
+        slide("part", "Alpha", { tick: t => (ticks.push(t), window.duringTick?.()) }),
         slide("part", "Beta"),
       ];
     },
     bands: { part: ["Part one", "The only band"] },
     tours: { ends: { title: "Both ends", summary: "first and last", slides: ["hello", "goodbye"] }, part: { title: "Just the part", bands: ["part"] }, ghost: { slides: ["nope"] } },
+    // ?themes: a light outro band without glows or grid
+    themes: query.has("themes") ? { outro: { light: true, base: [200, 209, 218], pal: ["#000000", "#000000", "#000000", "#000000"], grid: [200, 209, 218, 0, 0] } } : undefined,
     last: last === "none" ? null : last || "outro",
   });
 </script></body></html>`;
@@ -992,6 +996,76 @@ test.describe("reusable runtime", () => {
     return { requests, errors };
   };
   const heading = (page: Page) => page.locator(".slide.active h2");
+
+  // Probe installed before the deck: request ids start at 0 (the runtime's null sentinel), a cancelled callback is kept so
+  // replayCancelled can deliver it late with a non-frame timestamp, setHidden fakes visibility (a test page never hides),
+  // and nextFrames waits on the uncounted original. native: every tick got a timestamp the browser delivered.
+  type Snapshot = { requests: number; bg: number; gridc: number; pending: number; cancelled: number[]; ticks: number; perFrame: boolean; native: boolean };
+  type Probed = { ticks: number[]; duringTick?: () => void; nextFrames(n: number): Promise<void>; setHidden(hidden: boolean, announce?: boolean): void; replayCancelled(): number; snapshot(): Snapshot };
+  const GLOW = 5; // fills per glow repaint: the base and four glows
+  const probe = (page: Page, startHidden = false) =>
+    page.addInitScript((startHidden: boolean) => {
+      const w = window as unknown as Probed;
+      const raf = window.requestAnimationFrame.bind(window),
+        caf = window.cancelAnimationFrame.bind(window),
+        fill = CanvasRenderingContext2D.prototype.fillRect;
+      const pending = new Map<number, [number, FrameRequestCallback]>(),
+        held: FrameRequestCallback[] = [],
+        cancelled: number[] = [],
+        stamps = new Set<number>(),
+        fills = { bg: 0, gridc: 0 };
+      let requests = 0;
+      window.requestAnimationFrame = callback => {
+        const id = requests++;
+        const native = raf(t => {
+          pending.delete(id);
+          stamps.add(t);
+          callback(t);
+        });
+        pending.set(id, [native, callback]);
+        return id;
+      };
+      window.cancelAnimationFrame = id => {
+        cancelled.push(id);
+        const entry = pending.get(id);
+        if (!entry) return;
+        pending.delete(id);
+        caf(entry[0]);
+        held.push(entry[1]);
+      };
+      w.replayCancelled = () => held.splice(0).map(callback => callback(-1)).length;
+      CanvasRenderingContext2D.prototype.fillRect = function (this: CanvasRenderingContext2D, ...args: [number, number, number, number]) {
+        fills[this.canvas.className as keyof typeof fills]++;
+        fill.apply(this, args);
+      };
+      w.nextFrames = n =>
+        new Promise(done => {
+          const step = () => (--n > 0 ? raf(step) : done());
+          raf(step);
+        });
+      w.setHidden = (hidden, announce = true) => {
+        Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+        Object.defineProperty(document, "visibilityState", { configurable: true, get: () => (hidden ? "hidden" : "visible") });
+        if (announce) document.dispatchEvent(new Event("visibilitychange"));
+      };
+      w.snapshot = () => ({ requests, ...fills, pending: pending.size, cancelled: [...cancelled], ticks: w.ticks.length, perFrame: new Set(w.ticks).size === w.ticks.length, native: w.ticks.every(t => stamps.has(t)) });
+      if (startHidden) w.setHidden(true, false);
+    }, startHidden);
+  const state = (page: Page) => page.evaluate(() => (window as unknown as Probed).snapshot());
+  const frames = (page: Page, n = 6) => page.evaluate(n => (window as unknown as Probed).nextFrames(n), n);
+  const setHidden = (page: Page, hidden: boolean, announce = true) => page.evaluate(([hidden, announce]) => (window as unknown as Probed).setHidden(hidden, announce), [hidden, announce]);
+  const repaintAfter = async (page: Page, change: () => Promise<unknown>) => {
+    await frames(page);
+    const before = await state(page);
+    expect(before.pending).toBe(0);
+    await change();
+    await frames(page);
+    const after = await state(page);
+    await frames(page);
+    expect(await state(page)).toEqual(after);
+    expect(after.pending).toBe(0);
+    return { bg: after.bg - before.bg, gridc: after.gridc - before.gridc };
+  };
 
   test("runs a second deck without the talk's content, theme or sound", async ({ page }) => {
     const { requests, errors } = await open(page, "/gh-aw/cracktro/tiny.html#2");
@@ -1043,6 +1117,159 @@ test.describe("reusable runtime", () => {
       await expect(heading(page)).toHaveText("Beta");
       expect(errors).toEqual([]);
     }
+  });
+
+  test("paints a still background once and keeps frames only for the current slide's tick", async ({ page }) => {
+    await probe(page);
+    const { errors } = await open(page, "/gh-aw/cracktro/tiny.html#goodbye");
+    await expect(heading(page)).toHaveText("Goodbye");
+    await frames(page);
+    const still = await state(page);
+    expect(still).toMatchObject({ pending: 0, ticks: 0 });
+    expect(still.bg).toBeGreaterThan(0);
+    expect(still.gridc).toBeGreaterThan(0);
+    await frames(page);
+    expect(await state(page)).toEqual(still);
+    const resized = await repaintAfter(page, () => page.setViewportSize({ width: 900, height: 600 }));
+    expect(resized.bg).toBeGreaterThanOrEqual(GLOW);
+    expect(resized.gridc).toBeGreaterThan(0);
+
+    const quiet = await state(page);
+    await page.evaluate(() => (location.hash = "#alpha"));
+    await expect(heading(page)).toHaveText("Alpha");
+    await frames(page, 10);
+    const ticking = await state(page);
+    expect(ticking.ticks).toBeGreaterThanOrEqual(8);
+    expect(ticking).toMatchObject({ bg: quiet.bg, gridc: quiet.gridc, perFrame: true, native: true });
+    expect(ticking.pending).toBeLessThanOrEqual(1);
+
+    await page.evaluate(() => ((window as unknown as Probed).duringTick = () => dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowRight" }))));
+    await expect(heading(page)).toHaveText("Beta");
+    await frames(page);
+    const stopped = await state(page);
+    await frames(page);
+    expect(await state(page)).toEqual(stopped);
+    expect(stopped).toMatchObject({ bg: quiet.bg, gridc: quiet.gridc, pending: 0, perFrame: true });
+    expect(errors).toEqual([]);
+  });
+
+  test("drifts the glows only when motion is allowed and runs no frame while hidden", async ({ page }) => {
+    await probe(page);
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    const { errors } = await open(page, "/gh-aw/cracktro/tiny.html#alpha");
+    await expect(heading(page)).toHaveText("Alpha");
+    await frames(page);
+    const moving = await state(page);
+    await frames(page, 10);
+    const drifted = await state(page);
+    expect(drifted.bg - moving.bg).toBeGreaterThanOrEqual(8 * GLOW);
+    expect(drifted.gridc).toBe(moving.gridc);
+    expect(drifted.ticks - moving.ticks).toBeGreaterThanOrEqual(8);
+
+    await setHidden(page, true);
+    await setHidden(page, true);
+    const hidden = await state(page);
+    expect(hidden.pending).toBe(0);
+    await frames(page, 10);
+    expect(await state(page)).toEqual(hidden);
+
+    await setHidden(page, false, false);
+    await page.evaluate(() => dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await frames(page, 10);
+    const restored = await state(page);
+    expect(restored.ticks - hidden.ticks).toBeGreaterThanOrEqual(8);
+
+    await setHidden(page, false);
+    await setHidden(page, false);
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await page.setViewportSize({ width: 1000, height: 700 });
+    await frames(page, 10);
+    const joined = await state(page);
+    expect(joined.ticks - restored.ticks).toBeGreaterThanOrEqual(8);
+    expect(joined).toMatchObject({ perFrame: true, native: true });
+    expect(joined.pending).toBeLessThanOrEqual(1);
+
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await frames(page);
+    const reduced = await state(page);
+    await frames(page, 10);
+    const still = await state(page);
+    expect([still.bg, still.gridc]).toEqual([reduced.bg, reduced.gridc]);
+    expect(still.ticks - reduced.ticks).toBeGreaterThanOrEqual(8);
+    expect(still).toMatchObject({ perFrame: true, native: true });
+    expect(errors).toEqual([]);
+  });
+
+  test("repaints a still background once for a new band, a motion change or a restored canvas", async ({ page }) => {
+    await probe(page);
+    const { errors } = await open(page, "/gh-aw/cracktro/tiny.html?themes#beta");
+    await expect(heading(page)).toHaveText("Beta");
+    const band = await repaintAfter(page, () => page.keyboard.press("ArrowRight"));
+    await expect(heading(page)).toHaveText("Goodbye");
+    expect(band.bg).toBe(GLOW);
+    expect(band.gridc).toBeGreaterThan(0);
+    expect((await repaintAfter(page, () => page.emulateMedia({ reducedMotion: "no-preference" }))).bg).toBe(GLOW);
+    expect((await repaintAfter(page, () => page.locator("canvas.gridc").dispatchEvent("contextrestored"))).bg).toBe(GLOW);
+
+    // the staged light-to-dark swap starts easing while the light slide is still fading out
+    const before = (await state(page)).bg;
+    await page.keyboard.press("ArrowLeft");
+    await expect.poll(() => page.evaluate(b => ((window as unknown as Probed).snapshot().bg > b ? document.querySelector(".slide.active h2")?.textContent : null), before), { intervals: [50] }).toBe("Goodbye");
+    await expect(heading(page)).toHaveText("Beta");
+    await frames(page);
+    const dark = await state(page);
+    await frames(page, 10);
+    expect((await state(page)).bg - dark.bg).toBeGreaterThanOrEqual(8 * GLOW);
+    expect(errors).toEqual([]);
+  });
+
+  test("starts hidden, coalesces hidden changes and ignores stale or hidden frames", async ({ page }) => {
+    await probe(page, true);
+    const { errors } = await open(page, "/gh-aw/cracktro/tiny.html#alpha");
+    await expect(heading(page)).toHaveText("Alpha");
+    await page.emulateMedia({ reducedMotion: "no-preference" });
+    await frames(page, 2);
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.setViewportSize({ width: 900, height: 600 });
+    await page.keyboard.press("ArrowRight");
+    await page.keyboard.press("ArrowLeft");
+    await page.locator("canvas.bg").dispatchEvent("contextrestored");
+    await page.evaluate(() => dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+    await frames(page);
+    expect(await state(page)).toMatchObject({ requests: 0, bg: 0, gridc: 0, ticks: 0 });
+
+    const { shown, replayed, afterReplay } = await page.evaluate(() => {
+      const w = window as unknown as Probed;
+      for (const hidden of [false, false, true, false]) w.setHidden(hidden);
+      const shown = w.snapshot();
+      const replayed = w.replayCancelled();
+      return { shown, replayed, afterReplay: w.snapshot() };
+    });
+    expect(shown).toMatchObject({ requests: 2, pending: 1, cancelled: [0] });
+    expect(replayed).toBe(1);
+    expect(afterReplay).toEqual(shown);
+
+    await frames(page, 10);
+    const running = await state(page);
+    expect(running.ticks).toBeGreaterThanOrEqual(8);
+    expect(running).toMatchObject({ bg: GLOW, pending: 1, perFrame: true, native: true });
+    expect(running.requests - shown.requests).toBe(running.ticks);
+
+    const quiet = await page.evaluate(() => {
+      const w = window as unknown as Probed;
+      w.setHidden(true, false);
+      return w.snapshot();
+    });
+    await frames(page);
+    expect(await state(page)).toEqual({ ...quiet, pending: 0 });
+
+    await setHidden(page, false);
+    await frames(page, 10);
+    const back = await state(page);
+    expect(back.ticks - quiet.ticks).toBeGreaterThanOrEqual(8);
+    expect(back).toMatchObject({ bg: 2 * GLOW, pending: 1, perFrame: true, native: true });
+    expect(errors).toEqual([]);
   });
 
   test("walks a tour from the hash and leaves it on a jump outside", async ({ page }) => {

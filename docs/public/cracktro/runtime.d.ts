@@ -13,6 +13,7 @@ declare namespace CracktroDeck {
     under?: string;
     techno?: number;
     enter?(direction: number): void;
+    /** Called each visible frame, with its timestamp, while this slide is current. */
     tick?(time: number): void;
     onNext?(): boolean | void;
     onPrev?(): boolean | void;
