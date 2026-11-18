@@ -727,10 +727,7 @@
     let view = null;
     const vis = i => !view || view.set.has(i);
     const firstVis = () => slides.findIndex((s, i) => vis(i));
-    const lastVis = () => {
-      for (let i = slides.length - 1; i >= 0; i--) if (vis(i)) return i;
-      return -1;
-    };
+    const lastVis = () => { for (let i = slides.length - 1; i >= 0; i--) if (vis(i)) return i; return -1; };
     const hashFor = n => `#${slides[n].id}${view ? "&" + view.key : ""}`;
 
     // ---------- navigation ----------
@@ -1178,13 +1175,7 @@
     const fz = h(
       "dialog",
       { class: "fz", "aria-label": "Search slides" },
-      h(
-        "div",
-        { class: "fz-box" },
-        h("div", { class: "fz-bar" }, fzIn, h("button", { class: "fz-x", type: "button", "aria-label": "Close search (Esc)", "aria-keyshortcuts": "Escape", title: "Close search (Esc)", onclick: () => fz.close() }, "Esc")),
-        fzSt,
-        fzList
-      )
+      h("div", { class: "fz-box" }, h("div", { class: "fz-bar" }, fzIn, h("button", { class: "fz-x", type: "button", "aria-label": "Close search (Esc)", "aria-keyshortcuts": "Escape", title: "Close search (Esc)", onclick: () => fz.close() }, "Esc")), fzSt, fzList)
     );
     document.body.append(fz);
     const fzPaint = () => {
@@ -1293,12 +1284,7 @@
       "div",
       { class: "smp-d", role: "group", "aria-label": "Design a view" },
       smpCount,
-      dbtn("Select all", "A", "A", () =>
-        smpPick(
-          slides.map((s, i) => i),
-          true
-        )
-      ),
+      dbtn("Select all", "A", "A", () => smpPick(slides.map((s, i) => i), true)),
       dbtn("Clear", "C", "C", () => smpPick([...smpSel], false)),
       smpTitle,
       smpLink,
